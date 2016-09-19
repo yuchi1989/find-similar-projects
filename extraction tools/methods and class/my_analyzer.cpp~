@@ -1,0 +1,246 @@
+//------------------------------------------------------------------------------
+// AST matching sample. Demonstrates:
+//------------------------------------------------------------------------------
+#include <string>
+
+#include "clang/AST/AST.h"
+#include "clang/AST/ASTConsumer.h"
+#include "clang/ASTMatchers/ASTMatchers.h"
+#include "clang/ASTMatchers/ASTMatchFinder.h"
+#include "clang/Frontend/CompilerInstance.h"
+#include "clang/Frontend/FrontendActions.h"
+#include "clang/Lex/Lexer.h"
+#include "clang/Tooling/CommonOptionsParser.h"
+#include "clang/Tooling/Refactoring.h"
+#include "clang/Tooling/Tooling.h"
+#include "clang/Rewrite/Core/Rewriter.h"
+#include "llvm/Support/raw_ostream.h"
+#include <iostream>
+#include <unordered_set>
+#include <unordered_map>
+#include <string>
+#include <vector>
+#include <cmath>
+using namespace std;
+using namespace clang;
+using namespace clang::ast_matchers;
+using namespace clang::driver;
+using namespace clang::tooling;
+unordered_set<string> calleeset;
+unordered_map<string, unordered_set<string> > callingmap;
+
+static llvm::cl::OptionCategory MatcherSampleCategory("My Example");
+
+//get the source code of the specific parts of AST
+template <typename T>
+static std::string getText(const SourceManager &SourceManager, const T &Node) {
+  SourceLocation StartSpellingLocation =
+      SourceManager.getSpellingLoc(Node.getLocStart());
+  SourceLocation EndSpellingLocation =
+      SourceManager.getSpellingLoc(Node.getLocEnd());
+  if (!StartSpellingLocation.isValid() || !EndSpellingLocation.isValid()) {
+    return std::string();
+  }
+  bool Invalid = true;
+  const char *Text =
+      SourceManager.getCharacterData(StartSpellingLocation, &Invalid);
+  if (Invalid) {
+    return std::string();
+  }
+  std::pair<FileID, unsigned> Start =
+      SourceManager.getDecomposedLoc(StartSpellingLocation);
+  std::pair<FileID, unsigned> End =
+      SourceManager.getDecomposedLoc(Lexer::getLocForEndOfToken(
+          EndSpellingLocation, 0, SourceManager, LangOptions()));
+  if (Start.first != End.first) {
+    // Start and end are in different files.
+    return std::string();
+  }
+  if (End.second < Start.second) {
+    // Shuffling text with macros may cause this.
+    return std::string();
+  }
+  return std::string(Text, End.second - Start.second);
+}
+
+static std::string trim(const std::string& str,
+                 const std::string& whitespace = " \t")
+{
+    const auto strBegin = str.find_first_not_of(whitespace);
+    if (strBegin == std::string::npos)
+        return ""; // no content
+
+    const auto strEnd = str.find_last_not_of(whitespace);
+    const auto strRange = strEnd - strBegin + 1;
+
+    return str.substr(strBegin, strRange);
+}
+
+
+class ErrorHandler : public MatchFinder::MatchCallback {
+public:
+  ErrorHandler(Rewriter &Rewrite) : Rewrite(Rewrite) {}
+// get all the callee and caller and store these values to calleeset and callingmap
+// calleeset is a complete set for all the callee and callingmap is a map from caller to a set of callee
+
+  virtual void run(const MatchFinder::MatchResult &Result) {
+
+    if(const FunctionDecl *func = Result.Nodes.getNodeAs<FunctionDecl>("func")){
+      if(func->isThisDeclarationADefinition()){
+        clang::FullSourceLoc fullLoc(func->getNameInfo().getBeginLoc(), *Result.SourceManager);
+        std::string fileName = Result.SourceManager->getFilename(fullLoc);
+        unsigned int lineNum = fullLoc.getSpellingLineNumber();
+        const auto& SM = *Result.SourceManager;
+        if(SM.isInMainFile(func->getNameInfo().getBeginLoc())){
+          std::string category;
+          std::string functionname = func->getQualifiedNameAsString();
+          if(!isa<CXXMethodDecl>(func))category = "function";
+          else {
+            category = "member function";
+            const clang::CXXRecordDecl *classDecl = cast<CXXRecordDecl>(func->getParent());
+            std::string classname = classDecl->getQualifiedNameAsString();
+            //functionname = classname+"::"+functionname;
+          }
+          llvm::outs() << fileName
+                << ','
+                << lineNum
+                << ','
+                << category
+                << ','
+                << functionname         
+                <<'\n';
+        }
+        
+      }
+      
+    }
+    
+    if(const auto *classDecl = Result.Nodes.getNodeAs<CXXRecordDecl>("class")){
+      if(classDecl->isThisDeclarationADefinition()){
+        const auto& SM = *Result.SourceManager;
+        const auto& Loc = classDecl->getLocation();
+
+        string classname;
+        if(classDecl->isClass()&&SM.isInMainFile(Loc)){
+          classname = classDecl->getQualifiedNameAsString();
+        
+          llvm::outs() << SM.getFilename(Loc)
+              << ','
+              << SM.getSpellingLineNumber(Loc)
+              << ','
+              << "class"
+              << ','
+              << classname 
+              <<'\n';
+        }   
+        
+      }
+      
+    }  
+  }
+
+private:
+  Rewriter &Rewrite;
+};
+
+// Implementation of the ASTConsumer interface for reading an AST produced
+// by the Clang parser. It registers a couple of matchers and runs them on
+// the AST.
+class MyASTConsumer : public ASTConsumer {
+public:
+  MyASTConsumer(Rewriter &R) : HandleError(R),Rewrite(R) {
+    static DeclarationMatcher funcDecl = functionDecl().bind("func");
+    static DeclarationMatcher classDecl = cxxRecordDecl().bind("class");
+    
+    static StatementMatcher funcRef =
+    declRefExpr(              // referencing a variable/declaration
+        to(                   // something that is ...
+            functionDecl(     // ... a function
+
+            )
+        )
+    ).bind("ref");            // bind matched function ref to "ref" name
+  }
+  SourceLocation getRealStartLoc(SourceLocation loc){   
+
+    if( loc.isMacroID() ) {
+        // Get the start/end expansion locations
+        std::pair< SourceLocation, SourceLocation > expansionRange = 
+                 this->Rewrite.getSourceMgr().getImmediateExpansionRange( loc );
+
+        // We're just interested in the start location
+        loc = expansionRange.first;
+    }
+    return loc;
+  }
+   SourceLocation getRealEndLoc(SourceLocation loc){   
+
+    if( loc.isMacroID() ) {
+        // Get the start/end expansion locations
+        std::pair< SourceLocation, SourceLocation > expansionRange = 
+                 this->Rewrite.getSourceMgr().getImmediateExpansionRange( loc );
+
+        // We're just interested in the start location
+        loc = expansionRange.second;
+    }
+    return loc;
+  }
+  //definition of intersection for unordered_set
+  template <typename InIt1, typename InIt2, typename OutIt>
+  OutIt unordered_set_intersection(InIt1 b1, InIt1 e1, InIt2 b2, InIt2 e2, OutIt out) {
+      while (!(b1 == e1)) {
+          if (!(std::find(b2, e2, *b1) == e2)) {
+              *out = *b1;
+              ++out;
+          }
+
+          ++b1;
+      }
+
+      return out;
+  }
+
+  void HandleTranslationUnit(ASTContext &Context) override {
+    // Run the matchers when we have the whole TU parsed.
+    Matcher.matchAST(Context);
+   
+  }
+
+private:
+  ErrorHandler HandleError;
+  MatchFinder Matcher;
+  Rewriter &Rewrite;
+};
+
+// For each source file provided to the tool, a new FrontendAction is created.
+class MyFrontendAction : public ASTFrontendAction {
+public:
+  MyFrontendAction() {}
+  void EndSourceFileAction() override {
+     /*SourceManager &SM = TheRewriter.getSourceMgr();
+    StringRef FileName = SM.getFileEntryForID(SM.getMainFileID())->getName();
+    std::error_code ErrorInfo;
+    llvm::raw_fd_ostream FileStream(FileName, ErrorInfo,llvm::sys::fs::F_RW);
+    TheRewriter.getEditBuffer(TheRewriter.getSourceMgr().getMainFileID()).write(FileStream);
+  FileStream.flush();
+llvm::outs()<<"Patch target file successfully."<<'\n';
+TheRewriter.getEditBuffer(TheRewriter.getSourceMgr().getMainFileID())
+        .write(llvm::outs());*/
+  }
+
+  std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI,
+                                                 StringRef file) override {
+    TheRewriter.setSourceMgr(CI.getSourceManager(), CI.getLangOpts());
+    return llvm::make_unique<MyASTConsumer>(TheRewriter);
+  }
+
+private:
+  Rewriter TheRewriter;
+};
+
+int main(int argc, const char **argv) {
+  CommonOptionsParser op(argc, argv, MatcherSampleCategory);
+  RefactoringTool Tool(op.getCompilations(), op.getSourcePathList());
+
+  return Tool.runAndSave(newFrontendActionFactory<MyFrontendAction>().get());
+}
